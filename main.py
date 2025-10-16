@@ -457,6 +457,7 @@ def run_dce_export(
         "Json",
         "--after",
         str(start_id),
+        "--fuck-russia",
     ]
     if end_id is not None:
         cmd.extend(["--before", str(end_id)])
@@ -995,7 +996,9 @@ def combine_command(args: argparse.Namespace) -> None:
 
     print(f"Wrote combined export to {output_path} ({total_written} messages).")
     if skipped_threads:
-        print(f"Skipped {len(skipped_threads)} thread file(s) (combine currently targets the parent channel only).")
+        print(
+            f"Skipped {len(skipped_threads)} thread file(s) (combine currently targets the parent channel only)."
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
