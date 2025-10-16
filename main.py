@@ -410,7 +410,11 @@ def catalog_dce_json(path: Path) -> Tuple[int, Optional[str], Optional[str]]:
 def list_tmp_files(tmp_dir: Path) -> List[Path]:
     if not tmp_dir.exists():
         return []
-    return sorted([p for p in tmp_dir.iterdir() if p.is_file()])
+    entries: List[Path] = []
+    for path in sorted(tmp_dir.rglob("*")):
+        if path.is_file():
+            entries.append(path)
+    return entries
 
 
 def run_dce_export(
@@ -427,8 +431,13 @@ def run_dce_export(
     end_id: Optional[int],
     logger: Optional[Callable[[str], None]] = None,
 ) -> None:
+    if tmp_dir.exists():
+        for entry in tmp_dir.iterdir():
+            if entry.is_file():
+                entry.unlink()
+            else:
+                shutil.rmtree(entry, ignore_errors=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    output_path = tmp_dir / "dce.json"
 
     cmd: List[str] = [
         "docker",
@@ -457,8 +466,13 @@ def run_dce_export(
             include_threads,
             "--partition",
             str(partition),
+        ]
+    )
+    output_mount = tmp_dir.relative_to(archive_root).as_posix().rstrip("/")
+    cmd.extend(
+        [
             "--output",
-            f"/out/{tmp_dir.relative_to(archive_root)}/dce.json",
+            f"/out/{output_mount}/",
         ]
     )
     env = os.environ.copy()
@@ -482,8 +496,9 @@ def run_dce_export(
     retcode = process.wait()
     if retcode != 0:
         raise subprocess.CalledProcessError(retcode, cmd)
-    if not output_path.exists():
-        raise RuntimeError(f"DCE did not produce expected file at {output_path}")
+    produced_files = list_tmp_files(tmp_dir)
+    if not produced_files:
+        raise RuntimeError(f"DCE did not produce any files in {tmp_dir}")
 
 
 def promote_tmp_files(tmp_dir: Path, final_dir: Path) -> List[Path]:
