@@ -12,7 +12,9 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from tqdm import tqdm
 
 
 DISCORD_EPOCH_MS = 1420070400000
@@ -425,6 +427,7 @@ def run_dce_export(
     partition: int,
     start_id: int,
     end_id: Optional[int],
+    logger: Optional[Callable[[str], None]] = None,
 ) -> None:
     tmp_dir.mkdir(parents=True, exist_ok=True)
     output_path = tmp_dir / "dce.json"
@@ -462,7 +465,25 @@ def run_dce_export(
     )
     env = os.environ.copy()
     env["DCE_TOKEN"] = token
-    subprocess.run(cmd, check=True, env=env)
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    if logger is not None:
+        log_fn = logger
+    else:
+        log_fn = lambda msg: print(msg, flush=True)
+    for line in process.stdout:
+        cleaned = line.rstrip("\n")
+        log_fn(cleaned.replace("\r", ""))
+    retcode = process.wait()
+    if retcode != 0:
+        raise subprocess.CalledProcessError(retcode, cmd)
     if not output_path.exists():
         raise RuntimeError(f"DCE did not produce expected file at {output_path}")
 
@@ -525,102 +546,115 @@ def backfill_command(args: argparse.Namespace) -> None:
     state.set_windows(planned_windows)
 
     ordered_states = state.windows_ordered()
-    for state_entry in ordered_states:
-        window = Window(
-            window_id=state_entry.window_id,
-            start_ms=state_entry.start_ms,
-            end_ms=state_entry.end_ms,
-        )
-        if state_entry.status == "done" and args.resume:
-            continue
-
-        start_id = snowflake_floor(window.start_ms - args.overlap_ms)
-        end_id = snowflake_floor(window.end_ms + args.overlap_ms)
-
-        tmp_dir = tmp_root / window.window_id
-        final_dir = backfill_root / f"dt={ts_ms_to_iso(window.start_ms)[:10].replace('-', '/')}"
-
-        print(f"Exporting window {window.window_id}...")
-        state.update_window(
-            window.window_id,
-            status="running",
-            try_count=state_entry.try_count + 1,
-        )
-        try:
-            run_dce_export(
-                archive_root=channel_root,
-                tmp_dir=tmp_dir,
-                window_id=window.window_id,
-                token=token,
-                channel_id=channel_id,
-                dce_image=args.dce_image,
-                include_threads=args.include_threads,
-                partition=args.partition,
-                start_id=start_id,
-                end_id=end_id,
+    total_windows = len(ordered_states)
+    completed_windows = sum(1 for state_entry in ordered_states if state_entry.status == "done")
+    with tqdm(
+        total=total_windows,
+        desc="Backfill windows",
+        unit="window",
+        initial=completed_windows,
+    ) as progress:
+        progress.refresh()
+        for state_entry in ordered_states:
+            window = Window(
+                window_id=state_entry.window_id,
+                start_ms=state_entry.start_ms,
+                end_ms=state_entry.end_ms,
             )
-            promoted_files = promote_tmp_files(tmp_dir, final_dir)
-        except Exception as exc:  # noqa: BLE001 - propagate but reset state first
-            state.update_window(window.window_id, status="pending")
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise SystemExit(
-                f"Window {window.window_id} failed: {exc}"
-            ) from exc
+            if state_entry.status == "done" and args.resume:
+                continue
 
-        manifest_entries: List[str] = []
-        stats: Dict[str, Any] = {}
-        total_count = 0
-        window_min_id: Optional[int] = None
-        window_max_id: Optional[int] = None
+            start_id = snowflake_floor(window.start_ms - args.overlap_ms)
+            end_id = snowflake_floor(window.end_ms + args.overlap_ms)
 
-        for file_path in promoted_files:
-            count, min_id, max_id = catalog_dce_json(file_path)
-            total_count += count
-            if min_id is not None:
-                min_id_int = int(min_id)
-                if window_min_id is None or min_id_int < window_min_id:
-                    window_min_id = min_id_int
-            if max_id is not None:
-                max_id_int = int(max_id)
-                if window_max_id is None or max_id_int > window_max_id:
-                    window_max_id = max_id_int
-            relative_path = file_path.relative_to(out_dir).as_posix()
-            entry = ManifestEntry(
-                path=relative_path,
-                window_id=window.window_id,
-                start_ms=window.start_ms,
-                end_ms=window.end_ms,
-                count=count,
-                min_id=min_id,
-                max_id=max_id,
-                observed_min_ts=ts_ms_to_iso(snowflake_to_ts_ms(min_id))
-                if min_id
-                else None,
-                observed_max_ts=ts_ms_to_iso(snowflake_to_ts_ms(max_id))
-                if max_id
-                else None,
-                owns=True,
+            tmp_dir = tmp_root / window.window_id
+            final_dir = backfill_root / f"dt={ts_ms_to_iso(window.start_ms)[:10].replace('-', '/')}"
+
+            progress.set_postfix_str(f"export {window.window_id}")
+            state.update_window(
+                window.window_id,
+                status="running",
+                try_count=state_entry.try_count + 1,
             )
-            manifest.add_or_update_entry(entry)
-            manifest_entries.append(entry.path)
+            try:
+                run_dce_export(
+                    archive_root=channel_root,
+                    tmp_dir=tmp_dir,
+                    window_id=window.window_id,
+                    token=token,
+                    channel_id=channel_id,
+                    dce_image=args.dce_image,
+                    include_threads=args.include_threads,
+                    partition=args.partition,
+                    start_id=start_id,
+                    end_id=end_id,
+                    logger=progress.write,
+                )
+                promoted_files = promote_tmp_files(tmp_dir, final_dir)
+            except Exception as exc:  # noqa: BLE001 - propagate but reset state first
+                progress.set_postfix_str(f"failed {window.window_id}")
+                state.update_window(window.window_id, status="pending")
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                raise SystemExit(
+                    f"Window {window.window_id} failed: {exc}"
+                ) from exc
 
-        if window_max_id is not None:
-            manifest.set_high_water(str(window_max_id))
-            state.set_high_water(str(window_max_id))
+            manifest_entries: List[str] = []
+            stats: Dict[str, Any] = {}
+            total_count = 0
+            window_min_id: Optional[int] = None
+            window_max_id: Optional[int] = None
 
-        stats.update(
-            {
-                "count": total_count,
-                "min_id": str(window_min_id) if window_min_id is not None else None,
-                "max_id": str(window_max_id) if window_max_id is not None else None,
-            }
-        )
-        state.update_window(
-            window.window_id,
-            status="done",
-            files=manifest_entries,
-            stats=stats,
-        )
+            for file_path in promoted_files:
+                count, min_id, max_id = catalog_dce_json(file_path)
+                total_count += count
+                if min_id is not None:
+                    min_id_int = int(min_id)
+                    if window_min_id is None or min_id_int < window_min_id:
+                        window_min_id = min_id_int
+                if max_id is not None:
+                    max_id_int = int(max_id)
+                    if window_max_id is None or max_id_int > window_max_id:
+                        window_max_id = max_id_int
+                relative_path = file_path.relative_to(out_dir).as_posix()
+                entry = ManifestEntry(
+                    path=relative_path,
+                    window_id=window.window_id,
+                    start_ms=window.start_ms,
+                    end_ms=window.end_ms,
+                    count=count,
+                    min_id=min_id,
+                    max_id=max_id,
+                    observed_min_ts=ts_ms_to_iso(snowflake_to_ts_ms(min_id))
+                    if min_id
+                    else None,
+                    observed_max_ts=ts_ms_to_iso(snowflake_to_ts_ms(max_id))
+                    if max_id
+                    else None,
+                    owns=True,
+                )
+                manifest.add_or_update_entry(entry)
+                manifest_entries.append(entry.path)
+
+            if window_max_id is not None:
+                manifest.set_high_water(str(window_max_id))
+                state.set_high_water(str(window_max_id))
+
+            stats.update(
+                {
+                    "count": total_count,
+                    "min_id": str(window_min_id) if window_min_id is not None else None,
+                    "max_id": str(window_max_id) if window_max_id is not None else None,
+                }
+            )
+            state.update_window(
+                window.window_id,
+                status="done",
+                files=manifest_entries,
+                stats=stats,
+            )
+            progress.update(1)
+            progress.set_postfix_str("")
 
 
 def sync_command(args: argparse.Namespace) -> None:
