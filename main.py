@@ -876,7 +876,8 @@ def combine_command(args: argparse.Namespace) -> None:
     combined_before: Optional[Tuple[datetime, str]] = None
     first_guild: Optional[Dict[str, Any]] = None
     first_channel: Optional[Dict[str, Any]] = None
-    file_paths: List[Tuple[ManifestEntry, Path]] = []
+    file_paths: List[Tuple[ManifestEntry, Path, Dict[str, Any]]] = []
+    skipped_threads: List[str] = []
 
     for entry in selected:
         file_path = out_dir / entry.path
@@ -888,18 +889,41 @@ def combine_command(args: argparse.Namespace) -> None:
         channel_info = data.get("channel")
         if guild_info is None or channel_info is None:
             raise SystemExit(f"File {entry.path} missing guild/channel metadata.")
-        if first_guild is None:
+        channel_id_in_file = str(channel_info.get("id"))
+        expected_channel_id = str(args.channel_id)
+        if channel_id_in_file != expected_channel_id:
+            parent_id = (
+                str(channel_info.get("parentId"))
+                if channel_info.get("parentId") is not None
+                else None
+            )
+            category_id = (
+                str(channel_info.get("categoryId"))
+                if channel_info.get("categoryId") is not None
+                else None
+            )
+            channel_type = str(channel_info.get("type") or "")
+            if (
+                parent_id == expected_channel_id
+                or category_id == expected_channel_id
+                or "Thread" in channel_type
+            ):
+                skipped_threads.append(entry.path)
+                continue
+            if first_channel is not None:
+                raise SystemExit(
+                    f"Channel mismatch detected in {entry.path} (expected {first_channel.get('id')})"
+                )
+        if first_guild is None and channel_id_in_file == expected_channel_id:
             first_guild = guild_info
             first_channel = channel_info
-        else:
+        elif first_guild is not None and channel_id_in_file == expected_channel_id:
             if guild_info.get("id") != first_guild.get("id"):
                 raise SystemExit(
                     f"Guild mismatch detected in {entry.path} (expected {first_guild.get('id')})"
                 )
-            if channel_info.get("id") != first_channel.get("id"):
-                raise SystemExit(
-                    f"Channel mismatch detected in {entry.path} (expected {first_channel.get('id')})"
-                )
+        if channel_id_in_file != expected_channel_id:
+            continue
         date_range = data.get("dateRange") or {}
         after_str = date_range.get("after")
         before_str = date_range.get("before")
@@ -911,7 +935,7 @@ def combine_command(args: argparse.Namespace) -> None:
             before_dt = parse_dce_timestamp(before_str)
             if combined_before is None or before_dt > combined_before[0]:
                 combined_before = (before_dt, before_str)
-        file_paths.append((entry, file_path))
+        file_paths.append((entry, file_path, data))
 
     if first_guild is None or first_channel is None:
         raise SystemExit("Unable to determine guild/channel metadata for combination.")
@@ -945,9 +969,7 @@ def combine_command(args: argparse.Namespace) -> None:
         out_file.write(f'  "exportedAt": "{exported_at}",\n')
         out_file.write('  "messages": [\n')
 
-        for entry, file_path in file_paths:
-            with file_path.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
+        for entry, file_path, data in file_paths:
             for message in data.get("messages", []):
                 msg_id = str(message.get("id") or message.get("Id") or "")
                 if seen_ids is not None:
@@ -972,6 +994,8 @@ def combine_command(args: argparse.Namespace) -> None:
         out_file.write("}\n")
 
     print(f"Wrote combined export to {output_path} ({total_written} messages).")
+    if skipped_threads:
+        print(f"Skipped {len(skipped_threads)} thread file(s) (combine currently targets the parent channel only).")
 
 
 def build_parser() -> argparse.ArgumentParser:

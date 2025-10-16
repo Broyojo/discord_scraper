@@ -87,7 +87,7 @@ uv run main.py combine \
   --dedupe
 ```
 
-`combine` concatenates manifest-selected files (default: owned-only) into a single DCE-formatted JSON. The originals remain untouched. Use `--include-unowned` to merge every partition regardless of ownership and `--dedupe` to remove duplicate message IDs while combining.
+`combine` concatenates manifest-selected files (default: owned-only) into a single DCE-formatted JSON. The originals remain untouched. Use `--include-unowned` to merge every partition regardless of ownership and `--dedupe` to remove duplicate message IDs while combining. Thread exports (where `channel.parentId` matches the target channel) are skipped automatically; you can still inspect them directly from the archive.
 
 ### Inspect window plan
 
