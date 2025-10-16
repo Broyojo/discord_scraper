@@ -490,7 +490,10 @@ def run_dce_export(
     if logger is not None:
         log_fn = logger
     else:
-        log_fn = lambda msg: print(msg, flush=True)
+
+        def log_fn(msg: str, /):
+            print(msg, flush=True)
+
     for line in process.stdout:
         cleaned = line.rstrip("\n")
         log_fn(cleaned.replace("\r", ""))
