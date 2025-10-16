@@ -1,3 +1,5 @@
+set -euo pipefail
+
 uv run main.py backfill \
     --token $BOBBYBOT_TOKEN \
     --channel-id 699326565351162036 \
