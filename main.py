@@ -104,6 +104,20 @@ def ts_ms_to_iso(ts_ms: int) -> str:
     return dt.isoformat().replace("+00:00", "Z")
 
 
+def parse_dce_timestamp(value: str) -> datetime:
+    """Parse ISO strings emitted by DCE (accepts trailing Z or +00:00)."""
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    return datetime.fromisoformat(value)
+
+
+def format_json_block(value: Any, indent_level: int) -> str:
+    """Render JSON with two-space indentation aligned to the given base indent."""
+    raw = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=False)
+    indent_prefix = "  " * indent_level
+    return raw.replace("\n", "\n" + indent_prefix)
+
+
 def atomic_write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
@@ -764,6 +778,142 @@ def list_windows_command(args: argparse.Namespace) -> None:
         )
 
 
+def combine_command(args: argparse.Namespace) -> None:
+    channel_id = args.channel_id
+    out_dir = Path(args.out_dir).resolve()
+    channel_root = out_dir / f"channel={channel_id}"
+    manifest_file = (
+        Path(args.manifest_file).resolve()
+        if args.manifest_file
+        else channel_root / "_state" / "manifest.json"
+    )
+    manifest = ManifestStore(manifest_file, channel_id, 0)
+
+    entries = manifest.entries()
+    if not entries:
+        raise SystemExit("No manifest entries available for combination.")
+
+    selected: List[ManifestEntry] = []
+    for entry in entries:
+        if entry.owns or args.include_unowned:
+            selected.append(entry)
+    if not selected:
+        raise SystemExit(
+            "No manifest entries matched selection. Use --include-unowned to include all files."
+        )
+
+    def entry_sort_key(item: ManifestEntry) -> Tuple[int, str]:
+        if item.min_id is not None:
+            try:
+                return int(item.min_id), item.path
+            except ValueError:
+                pass
+        return (item.start_ms, item.path)
+
+    selected.sort(key=entry_sort_key)
+
+    combined_after: Optional[Tuple[datetime, str]] = None
+    combined_before: Optional[Tuple[datetime, str]] = None
+    first_guild: Optional[Dict[str, Any]] = None
+    first_channel: Optional[Dict[str, Any]] = None
+    file_paths: List[Tuple[ManifestEntry, Path]] = []
+
+    for entry in selected:
+        file_path = out_dir / entry.path
+        if not file_path.exists():
+            raise SystemExit(f"Manifest references missing file: {entry.path}")
+        with file_path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        guild_info = data.get("guild")
+        channel_info = data.get("channel")
+        if guild_info is None or channel_info is None:
+            raise SystemExit(f"File {entry.path} missing guild/channel metadata.")
+        if first_guild is None:
+            first_guild = guild_info
+            first_channel = channel_info
+        else:
+            if guild_info.get("id") != first_guild.get("id"):
+                raise SystemExit(
+                    f"Guild mismatch detected in {entry.path} (expected {first_guild.get('id')})"
+                )
+            if channel_info.get("id") != first_channel.get("id"):
+                raise SystemExit(
+                    f"Channel mismatch detected in {entry.path} (expected {first_channel.get('id')})"
+                )
+        date_range = data.get("dateRange") or {}
+        after_str = date_range.get("after")
+        before_str = date_range.get("before")
+        if after_str:
+            after_dt = parse_dce_timestamp(after_str)
+            if combined_after is None or after_dt < combined_after[0]:
+                combined_after = (after_dt, after_str)
+        if before_str:
+            before_dt = parse_dce_timestamp(before_str)
+            if combined_before is None or before_dt > combined_before[0]:
+                combined_before = (before_dt, before_str)
+        file_paths.append((entry, file_path))
+
+    if first_guild is None or first_channel is None:
+        raise SystemExit("Unable to determine guild/channel metadata for combination.")
+
+    combined_range = {
+        "after": combined_after[1] if combined_after else None,
+        "before": combined_before[1] if combined_before else None,
+    }
+
+    output_path = (
+        Path(args.output_file).resolve()
+        if args.output_file
+        else channel_root / "combined" / "dce-combined.json"
+    )
+    if output_path.exists() and not args.overwrite:
+        raise SystemExit(
+            f"Output file {output_path} already exists. Use --overwrite to replace it."
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    exported_at = datetime.now(tz=UTC).isoformat()
+    total_written = 0
+    seen_ids: Optional[set[str]] = set() if args.dedupe else None
+    first_message = True
+
+    with output_path.open("w", encoding="utf-8") as out_file:
+        out_file.write("{\n")
+        out_file.write('  "guild": ' + format_json_block(first_guild, 1) + ",\n")
+        out_file.write('  "channel": ' + format_json_block(first_channel, 1) + ",\n")
+        out_file.write('  "dateRange": ' + format_json_block(combined_range, 1) + ",\n")
+        out_file.write(f'  "exportedAt": "{exported_at}",\n')
+        out_file.write('  "messages": [\n')
+
+        for entry, file_path in file_paths:
+            with file_path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            for message in data.get("messages", []):
+                msg_id = str(message.get("id") or message.get("Id") or "")
+                if seen_ids is not None:
+                    if not msg_id:
+                        continue
+                    if msg_id in seen_ids:
+                        continue
+                    seen_ids.add(msg_id)
+                message_json = json.dumps(
+                    message, ensure_ascii=False, indent=2, sort_keys=False
+                )
+                message_json = message_json.replace("\n", "\n    ")
+                if first_message:
+                    out_file.write("    " + message_json)
+                    first_message = False
+                else:
+                    out_file.write(",\n    " + message_json)
+                total_written += 1
+
+        out_file.write("\n  ],\n")
+        out_file.write(f'  "messageCount": {total_written}\n')
+        out_file.write("}\n")
+
+    print(f"Wrote combined export to {output_path} ({total_written} messages).")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="archiver", description="Discord channel archiver orchestrator.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -811,6 +961,30 @@ def build_parser() -> argparse.ArgumentParser:
     list_windows = sub.add_parser("list-windows", help="List planned windows from a state file")
     list_windows.add_argument("--state-file", required=True, help="Path to state.json")
 
+    combine = sub.add_parser(
+        "combine",
+        help="Combine manifest-selected partitions into a single DCE export file",
+    )
+    combine.add_argument("--channel-id", required=True, help="Target Discord channel ID")
+    combine.add_argument("--out", dest="out_dir", default="./archive", help="Archive output directory")
+    combine.add_argument("--manifest-file", help="Override manifest path")
+    combine.add_argument("--output-file", help="Destination file for combined export")
+    combine.add_argument(
+        "--include-unowned",
+        action="store_true",
+        help="Include manifest entries marked owns=false",
+    )
+    combine.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite destination file if it already exists",
+    )
+    combine.add_argument(
+        "--dedupe",
+        action="store_true",
+        help="De-duplicate messages by ID while combining (uses additional memory)",
+    )
+
     return parser
 
 
@@ -836,6 +1010,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         verify_command(args)
     elif command == "list-windows":
         list_windows_command(args)
+    elif command == "combine":
+        combine_command(args)
     else:
         parser.error(f"Unknown command '{command}'")
 
