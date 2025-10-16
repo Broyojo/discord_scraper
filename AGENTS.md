@@ -1,0 +1,1 @@
+I am using `uv` for this project, so instead of using python or pip, please us `uv`. You can use it for running programs as well as adding depdenencies, like `uv add <package>`.
