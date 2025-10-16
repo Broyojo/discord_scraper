@@ -1,8 +1,8 @@
 # Discord Channel Archiver — DCE‑Native, Resumable Export (Clean Spec)
 
 **Owner:** David “Broyojo” Andrews
-**Status:** Draft v1.0 (clean copy)
-**Purpose:** Implement a resumable, additive archival pipeline for a Discord text channel (and its threads) by orchestrating **DiscordChatExporter (DCE)** in Docker with windowing, checkpoints, and manifest‑level deduplication — **preserving DCE JSON output exactly**.
+**Status:** Working v1.0 (Python implementation)
+**Purpose:** Implement a resumable, additive archival pipeline for a Discord text channel (and its threads) by orchestrating **DiscordChatExporter (DCE)** in Docker with windowing, checkpoints, manifest‑level deduplication, and optional compaction — **preserving DCE JSON output exactly**.
 
 ---
 
@@ -15,8 +15,9 @@
 * **Incremental sync:** add only new messages since the **high‑water mark (HWM)**.
 * **Deterministic windowing** (time or ID) with **small overlaps** to avoid fencepost misses.
 * **Deduplication** by message ID via **manifest selection** (no in‑file edits).
-* **Verification** per window and global coverage checks.
-* **CLI interface** accepting bot token + channel ID plus config/overrides.
+* **Verification** per window and manifest-level sanity checks.
+* **CLI interface** accepting bot token + channel ID plus runtime flags (no external config yet).
+* **Optional compaction** command to merge manifest-selected partitions into a single DCE-formatted JSON export.
 
 ### 1.2 Non‑Goals
 
@@ -39,11 +40,12 @@ The tool is an **orchestrator** around DCE. It plans **windows**, runs DCE with 
 1. **Planner** — computes window boundaries (time/ID) with overlap.
 2. **Runner** — invokes DCE in Docker for a specific window; writes to a temp folder then promotes to final location on success.
 3. **Cataloger** — parses DCE JSON files to compute stats; updates manifest/state. **Never modifies file contents.**
-4. **Manifest Deduper** — assigns message‑ID ownership to exactly one file per overlap policy; downstream tools read **only selected files**.
+4. **Manifest Deduper** — assigns message‑ID ownership to exactly one file per overlap policy; downstream tools read **only selected files** (current policy: left‑biased by window start).
 5. **State Store** — JSON file tracking windows, retries, and per‑channel HWM.
 6. **Validator** — per‑window and global checks; identifies gaps.
 7. **Incremental Sync** — single open‑ended window from HWM→now; updates HWM.
-8. **Thread Strategy** — either `--include-threads All` (simple) or enumerate thread IDs and treat each as a subchannel (advanced mode).
+8. **Thread Strategy** — relies on DCE `--include-threads` flag (thread enumeration is a future enhancement).
+9. **Progress Reporter** — renders `tqdm` progress bars for backfill windows and incremental sync stages while streaming Docker output.
 
 ---
 
@@ -138,7 +140,7 @@ archive/
 
 ### 4.1 Window Planning
 
-* Default: **calendar‑day** windows; configurable: calendar‑hour, week, or message‑count windows.
+* Default: **calendar‑day** windows; configurable: calendar‑hour or calendar‑week windows.
 * Adjacent windows get **±overlap_ms** (e.g., 5m). Overlap is handled at manifest level (file selection), not by rewriting files.
 * Boundaries are computed as snowflake floors for `--after/--before`.
 
@@ -164,41 +166,39 @@ docker run --rm \
 ```
 
 3. On success: move `/out/tmp/$WINDOW_ID/*` → `backfill/dt=YYYY/MM/DD/` and record paths in state.
-4. On failure: leave window `pending` (or `failed` if non‑recoverable); retry with backoff. Optional **auto‑shrink** window if retries exceed threshold.
+4. On failure: leave window `pending` (or `failed` if non‑recoverable); manual retry resumes the same window.
 
 ### 4.3 Catalog & Manifest Deduplication (No Mutation)
 
 * **Cataloger** parses each produced DCE JSON file, computes `count`, `min_id`, `max_id`, `observed_min_ts`, `observed_max_ts`; updates `manifest.json` entry for the file.
-* **Deduper policy:** for overlapping windows, set `owns=true` on exactly one file for any overlapping message IDs. Deterministic rule examples:
-
-  * Prefer file whose window **start** is closest to the message timestamp, or
-  * Prefer the **earlier** window (left‑biased), or
-  * Prefer **later** window (right‑biased).
-* Ownership is calculated at **file granularity** using `min_id/max_id`. If two files’ ranges overlap, and policy prefers left‑biased, mark the right file `owns=false` for that overlap range. (If partial overlaps are frequent, switch to smaller partitions or switch policy to per‑ID index in the manifest.)
+* **Deduper policy:** overlapping windows are resolved with a deterministic **left‑biased** rule (the earliest window keeps ownership). Only files with `owns=true` participate in downstream reads.
+* Ownership is calculated at **file granularity** using `min_id/max_id`. If partial overlaps are frequent, shrink partitions or enhance the manifest logic (future work).
 * Downstream tools read **only files with `owns=true`** for a deduped view.
 
 ### 4.4 Verification
 
-* Per‑window checks:
+* Per‑window checks (performed during ingestion):
 
-  * `stats.count > 0` unless known quiet window.
-  * All message timestamps inside `[start_ms - overlap_ms, end_ms + overlap_ms)`.
-  * Snowflake monotonicity sanity (min→max).
-* Global checks:
+  * Record total `count`, `min_id`, `max_id` per exported file.
+  * Persist per-window status (`pending`, `running`, `done`) and retry count.
+* Manifest verification command re-reads files to validate:
 
-  * Coverage by day; flag long zero runs in otherwise busy periods.
-  * `distinct(id)` across **owned** files equals total messages.
+  * File existence and message counts.
+  * `min_id`/`max_id` parity with manifest metadata.
+  * Overlap detection among `owns=true` files.
+* Future enhancements: coverage histograms and distinct-ID rollups.
 
 ### 4.5 Incremental Sync
 
 1. Read `high_water_id` (HWM).
-2. Run single DCE export with `--after (HWM - overlap)` and no `--before` into `incremental/run=<stamp>/`.
-3. Catalog files; update manifest (set ownership true for incremental files unless they overlap with last backfill window per policy).
-4. Set `HWM = max(HWM, max_id_over_incremental)`.
+2. Run a single DCE export with `--after (HWM - overlap)` and no `--before` into `incremental/run=<stamp>/`, streaming container output through a `tqdm` progress bar.
+3. Catalog resulting files; update manifest (incremental files default to `owns=true`).
+4. Set `HWM = max(HWM, max_id_over_incremental)` and persist it in both state and manifest metadata.
 
 ### 4.6 Consolidation (Optional)
 
-* Maintain only the manifest as the deduped list of files. Optionally generate **compacted DCE‑schema** exports (e.g., monthly) for convenience; originals remain immutable.
+* Maintain only the manifest as the deduped list of files. The `combine` command can merge manifest-selected partitions into a single DCE-formatted JSON file without altering the originals.
+* Future: generate larger rollups on a schedule (e.g., monthly) while keeping raw partitions intact.
 
 ---
 
@@ -211,51 +211,33 @@ archiver backfill \
   --token $DISCORD_TOKEN \
   --channel-id 123... \
   [--start 2017-08-01] [--end 2025-10-16] \
-  [--window calendar-day|calendar-hour|messages:N] \
+  [--window calendar-day|calendar-hour|calendar-week] \
   [--overlap 5m] \
   [--out ./archive] \
   [--dce-image ghcr.io/broyojo/dce:latest] \
   [--dce-partition 50000] \
-  [--include-threads all|none] \
-  [--concurrency 2] \
+  [--include-threads all|active|none] \
   [--state ./archive/channel=<id>/_state/state.json] \
   [--resume] [--dry-run] [--verify-only]
 
 archiver sync \
   --token $DISCORD_TOKEN \
   --channel-id 123... \
-  [--overlap 5m] [--out ./archive]
+  [--overlap 5m] [--out ./archive] [--dce-image ...] [--include-threads ...]
 
-archiver verify --out ./archive --channel-id 123...
+archiver verify --out ./archive --channel-id 123... [--manifest-file ...]
 archiver list-windows --state ./archive/channel=<id>/_state/state.json
+archiver combine --out ./archive --channel-id 123... \
+  [--manifest-file ...] [--output-file ...] [--include-unowned] [--overwrite] [--dedupe]
 ```
 
 ### 5.2 Config File (TOML)
 
-```toml
-[channel]
-id = "123456789012345678"
-
-[planner]
-mode = "calendar-day"
-overlap = "5m"
-start = "2017-08-01"
-end   = "2025-10-16"
-
-[dce]
-image = "ghcr.io/broyojo/dce:latest"
-partition = 50000
-include_threads = "All"
-
-[io]
-out_dir = "./archive"
-state_file = "./archive/channel=123/_state/state.json"
-```
+*Not yet implemented.* CLI flags and environment variables are the current configuration surfaces.
 
 ### 5.3 Env Vars
 
-* `DISCORD_TOKEN` (overridden by `--token`)
-* `ARCHIVER_OUT_DIR`, `ARCHIVER_STATE_FILE`
+* `DISCORD_TOKEN` (overridden by `--token`).
 
 ---
 
@@ -289,29 +271,32 @@ docker run --rm \
   --output /out/tmp/$WINDOW_ID/dce.json
 ```
 
+*Implementation detail:* stdout/stderr from the container is piped through the Python orchestrator so progress bars remain intact while surfacing DCE status messages.
+
 ---
 
 ## 7) Failure Handling & Resume
 
 * Window statuses: `pending → running → done` (or `failed`).
-* On crash: rerun any non‑`done` windows; outputs are **overwritten** safely.
-* Retries with exponential backoff; optional **auto‑shrink** (split window) after N failures.
-* Errors: auth/permission → `failed` and halt; 429/5xx → retried by DCE during run, and by orchestrator across runs.
+* On crash: rerun any non‑`done` windows; outputs are **overwritten** safely after successful rerun.
+* Errors bubble up with container logs preserved in stdout; operator reruns the command once issues are resolved.
 
 ---
 
 ## 8) Validation & Health
 
-* **Per‑window:** counts, min/max id, observed min/max timestamps.
-* **Global:** coverage chart by day; `distinct(id)` over **owned** files equals total; HWM monotonic increase after `sync`.
-* Emit `_state/manifest.json` as the source of truth for downstream reads.
+* **Per‑window:** counts, min/max id, observed min/max timestamps persisted in state/manifest.
+* **Manifest verify:** replays catalog stats and flags overlaps or mismatches.
+* **High-water tracking:** stored in both state and manifest; sync increases it monotonically.
+* Future work: coverage charts, end-to-end distinct ID reconciliation, structured health reports.
 
 ---
 
 ## 9) Observability
 
-* Structured logs per window (start/end, exit code, produced files, stats, retries).
-* Metrics (optional): windows_processed, files_owned, rows_estimated, retries, last_run_seconds.
+* `tqdm` progress bars for backfill windows, sync export, and per-file cataloging.
+* DCE stdout/stderr streamed through the progress writer so container messages remain visible.
+* Future work: structured logs, metrics (windows_processed, retries, etc.).
 
 ---
 
@@ -326,7 +311,7 @@ docker run --rm \
 
 * Start with 1‑day windows; tune by observed counts (target ~50k–150k msgs/window). Smaller windows improve recovery.
 * 6M msgs ~ **5–7 GB** raw DCE JSON; can be reduced by filesystem compression.
-* Concurrency: 1–2 windows in flight typically stable under Discord rate limits.
+* Current runner is single-threaded; concurrency is future work once rate limiting policy is better understood.
 
 ---
 
@@ -341,10 +326,11 @@ docker run --rm \
 
 ## 13) Implementation Notes
 
-* Language: Go/Rust preferred; Python acceptable with streaming JSON parse.
+* Language: Python 3.12 (`tqdm` for progress, standard library JSON parsing).
 * Promotion pattern: write under `tmp/` then **atomic rename/move** on success.
-* Cataloger should stream‑parse `messages[]` to avoid large memory use.
-* Manifest updates should be atomic (write to temp then rename) to avoid corruption.
+* Cataloger currently loads each DCE file into memory; consider streaming (`ijson`) for very large partitions.
+* Manifest and state updates use atomic temp-file writes to avoid corruption.
+* `combine` command concatenates manifest-selected files without mutating original DCE payloads; optional message-ID dedupe is available.
 
 ---
 
@@ -371,6 +357,12 @@ archiver sync --token $DISCORD_TOKEN --channel-id 123... --out ./archive --overl
 archiver verify --out ./archive --channel-id 123...
 ```
 
+* **Combine:**
+
+```
+archiver combine --out ./archive --channel-id 123... --output-file ./archive/channel=123/combined/dce.json
+```
+
 ---
 
 ## 15) Future Extensions
@@ -379,6 +371,7 @@ archiver verify --out ./archive --channel-id 123...
 * Optional compactor to produce monthly **DCE‑schema** merged files.
 * Media fetcher with checksums and bounded concurrency.
 * Gateway listener to capture edits/deletes into an auxiliary event log.
+* Config file parsing and richer policy controls (ownership strategies, auto-splitting).
 
 ---
 

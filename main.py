@@ -6,7 +6,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -15,7 +14,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from tqdm import tqdm
-
 
 DISCORD_EPOCH_MS = 1420070400000
 
@@ -510,7 +508,9 @@ def backfill_command(args: argparse.Namespace) -> None:
     if not token:
         token = os.environ.get("DISCORD_TOKEN", "")
     if not token and not (args.dry_run or args.verify_only):
-        raise SystemExit("A Discord bot token is required (use --token or --token-file).")
+        raise SystemExit(
+            "A Discord bot token is required (use --token or --token-file)."
+        )
 
     channel_id = args.channel_id
     out_dir = Path(args.out_dir).resolve()
@@ -547,7 +547,9 @@ def backfill_command(args: argparse.Namespace) -> None:
 
     ordered_states = state.windows_ordered()
     total_windows = len(ordered_states)
-    completed_windows = sum(1 for state_entry in ordered_states if state_entry.status == "done")
+    completed_windows = sum(
+        1 for state_entry in ordered_states if state_entry.status == "done"
+    )
     with tqdm(
         total=total_windows,
         desc="Backfill windows",
@@ -568,7 +570,10 @@ def backfill_command(args: argparse.Namespace) -> None:
             end_id = snowflake_floor(window.end_ms + args.overlap_ms)
 
             tmp_dir = tmp_root / window.window_id
-            final_dir = backfill_root / f"dt={ts_ms_to_iso(window.start_ms)[:10].replace('-', '/')}"
+            final_dir = (
+                backfill_root
+                / f"dt={ts_ms_to_iso(window.start_ms)[:10].replace('-', '/')}"
+            )
 
             progress.set_postfix_str(f"export {window.window_id}")
             state.update_window(
@@ -595,9 +600,7 @@ def backfill_command(args: argparse.Namespace) -> None:
                 progress.set_postfix_str(f"failed {window.window_id}")
                 state.update_window(window.window_id, status="pending")
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-                raise SystemExit(
-                    f"Window {window.window_id} failed: {exc}"
-                ) from exc
+                raise SystemExit(f"Window {window.window_id} failed: {exc}") from exc
 
             manifest_entries: List[str] = []
             stats: Dict[str, Any] = {}
@@ -727,8 +730,12 @@ def sync_command(args: argparse.Namespace) -> None:
             count=count,
             min_id=min_id,
             max_id=max_id,
-            observed_min_ts=ts_ms_to_iso(snowflake_to_ts_ms(min_id)) if min_id else None,
-            observed_max_ts=ts_ms_to_iso(snowflake_to_ts_ms(max_id)) if max_id else None,
+            observed_min_ts=ts_ms_to_iso(snowflake_to_ts_ms(min_id))
+            if min_id
+            else None,
+            observed_max_ts=ts_ms_to_iso(snowflake_to_ts_ms(max_id))
+            if max_id
+            else None,
             owns=True,
         )
         manifest.add_or_update_entry(entry)
@@ -761,7 +768,9 @@ def verify_manifest(manifest: ManifestStore, out_dir: Path) -> None:
         if entry.owns:
             owned_count += count
         if count != entry.count:
-            problems.append(f"Count mismatch for {entry.path}: manifest={entry.count}, actual={count}")
+            problems.append(
+                f"Count mismatch for {entry.path}: manifest={entry.count}, actual={count}"
+            )
         if min_id != entry.min_id:
             problems.append(
                 f"min_id mismatch for {entry.path}: manifest={entry.min_id}, actual={min_id}"
@@ -778,7 +787,9 @@ def verify_manifest(manifest: ManifestStore, out_dir: Path) -> None:
         if entry.owns and max_id_int is not None:
             last_max = max_id_int
 
-    print(f"Manifest checks complete. Total messages: {total_count}, owned: {owned_count}")
+    print(
+        f"Manifest checks complete. Total messages: {total_count}, owned: {owned_count}"
+    )
     if problems:
         print("Issues detected:")
         for issue in problems:
@@ -807,8 +818,8 @@ def list_windows_command(args: argparse.Namespace) -> None:
         start = ts_ms_to_iso(window["start_ms"])
         end = ts_ms_to_iso(window["end_ms"])
         print(
-            f"{window['window_id']:>16} {window.get('status','pending'):>10} "
-            f"{window.get('try_count',0):>3} {start} -> {end}"
+            f"{window['window_id']:>16} {window.get('status', 'pending'):>10} "
+            f"{window.get('try_count', 0):>3} {start} -> {end}"
         )
 
 
@@ -949,29 +960,52 @@ def combine_command(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="archiver", description="Discord channel archiver orchestrator.")
+    parser = argparse.ArgumentParser(
+        prog="archiver", description="Discord channel archiver orchestrator."
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_common_export_args(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--token", help="Discord bot token")
-        subparser.add_argument("--token-file", help="Path to file containing the bot token")
-        subparser.add_argument("--channel-id", required=True, help="Target Discord channel ID")
-        subparser.add_argument("--out", dest="out_dir", default="./archive", help="Archive output directory")
-        subparser.add_argument("--dce-image", default="ghcr.io/broyojo/dce:latest", help="Docker image for DiscordChatExporter")
+        subparser.add_argument(
+            "--token-file", help="Path to file containing the bot token"
+        )
+        subparser.add_argument(
+            "--channel-id", required=True, help="Target Discord channel ID"
+        )
+        subparser.add_argument(
+            "--out",
+            dest="out_dir",
+            default="./archive",
+            help="Archive output directory",
+        )
+        subparser.add_argument(
+            "--dce-image",
+            default="tyrrrz/discordchatexporter:stable",
+            help="Docker image for DiscordChatExporter",
+        )
         subparser.add_argument(
             "--include-threads",
             default="All",
             choices=["All", "Active", "None", "all", "active", "none"],
             help="Thread inclusion policy for DCE exports",
         )
-        subparser.add_argument("--partition", type=int, default=50_000, help="DCE partition size")
+        subparser.add_argument(
+            "--partition", type=int, default=50_000, help="DCE partition size"
+        )
         subparser.add_argument("--state-file", help="Override path to state.json")
-        subparser.add_argument("--overlap", default="5m", help="Window overlap (e.g. 5m, 30s)")
+        subparser.add_argument(
+            "--overlap", default="5m", help="Window overlap (e.g. 5m, 30s)"
+        )
 
     backfill = sub.add_parser("backfill", help="Run a historical backfill export")
     add_common_export_args(backfill)
-    backfill.add_argument("--start", type=parse_date_or_datetime, help="Backfill start datetime (UTC)")
-    backfill.add_argument("--end", type=parse_date_or_datetime, help="Backfill end datetime (UTC)")
+    backfill.add_argument(
+        "--start", type=parse_date_or_datetime, help="Backfill start datetime (UTC)"
+    )
+    backfill.add_argument(
+        "--end", type=parse_date_or_datetime, help="Backfill end datetime (UTC)"
+    )
     backfill.add_argument(
         "--window",
         dest="window_mode",
@@ -979,28 +1013,42 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["calendar-day", "calendar-hour", "calendar-week"],
         help="Windowing strategy",
     )
-    backfill.add_argument("--resume", action="store_true", help="Resume from existing state if present")
-    backfill.add_argument("--dry-run", action="store_true", help="Plan windows without executing exports")
-    backfill.add_argument("--verify-only", action="store_true", help="Only run manifest verification")
+    backfill.add_argument(
+        "--resume", action="store_true", help="Resume from existing state if present"
+    )
+    backfill.add_argument(
+        "--dry-run", action="store_true", help="Plan windows without executing exports"
+    )
+    backfill.add_argument(
+        "--verify-only", action="store_true", help="Only run manifest verification"
+    )
 
     sync = sub.add_parser("sync", help="Run incremental sync from the high-water mark")
     add_common_export_args(sync)
 
     verify = sub.add_parser("verify", help="Verify manifest and file integrity")
     verify.add_argument("--channel-id", required=True, help="Target Discord channel ID")
-    verify.add_argument("--out", dest="out_dir", default="./archive", help="Archive output directory")
+    verify.add_argument(
+        "--out", dest="out_dir", default="./archive", help="Archive output directory"
+    )
     verify.add_argument("--manifest-file", help="Override manifest path")
     verify.add_argument("--overlap", dest="overlap_ms", default="5m")
 
-    list_windows = sub.add_parser("list-windows", help="List planned windows from a state file")
+    list_windows = sub.add_parser(
+        "list-windows", help="List planned windows from a state file"
+    )
     list_windows.add_argument("--state-file", required=True, help="Path to state.json")
 
     combine = sub.add_parser(
         "combine",
         help="Combine manifest-selected partitions into a single DCE export file",
     )
-    combine.add_argument("--channel-id", required=True, help="Target Discord channel ID")
-    combine.add_argument("--out", dest="out_dir", default="./archive", help="Archive output directory")
+    combine.add_argument(
+        "--channel-id", required=True, help="Target Discord channel ID"
+    )
+    combine.add_argument(
+        "--out", dest="out_dir", default="./archive", help="Archive output directory"
+    )
     combine.add_argument("--manifest-file", help="Override manifest path")
     combine.add_argument("--output-file", help="Destination file for combined export")
     combine.add_argument(
